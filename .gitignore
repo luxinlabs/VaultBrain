@@ -62,3 +62,7 @@ Thumbs.db
 # Logs
 logs/
 *.log
+
+
+# .md
+ARCHITECTURE.md

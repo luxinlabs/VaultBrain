@@ -1,6 +1,9 @@
 import ForceGraph2D, { NodeObject } from "react-force-graph-2d";
 import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import "./App.css";
+import InstructionPage from "./pages/InstructionPage";
+import TeamSessionPage from "./pages/TeamSessionPage";
+import CollabPadPage from "./pages/CollabPadPage";
 
 const API_URL = import.meta.env.VITE_API_URL || "http://localhost:3001";
 
@@ -9,6 +12,92 @@ interface User {
   email: string;
   name: string;
   role: "partner" | "analyst";
+}
+
+function computeInvestmentCriteria(
+  content: string,
+  timeline: TimelineEntry[],
+  signals: HogSignal[],
+  fallbackSector?: string,
+) {
+  const text =
+    `${content} ${signals.map((s) => s.content).join(" ")}`.toLowerCase();
+  const timelineText = timeline
+    .map((t) => t.description)
+    .join(" ")
+    .toLowerCase();
+  const combined = `${text} ${timelineText}`;
+
+  const marketKeywords = [
+    "market",
+    "tam",
+    "billion",
+    "customer",
+    "consumer",
+    "enterprise",
+    "utilities",
+  ];
+  const hasMarketSignal = marketKeywords.some((kw) => combined.includes(kw));
+
+  const tractionMentions =
+    signals.filter((s) =>
+      ["mentions", "press", "product", "funding"].includes(s.type),
+    ).length +
+    timeline.filter((entry) =>
+      ["mentions", "press", "product"].includes(entry.event_type),
+    ).length;
+
+  const teamKeywords = ["hire", "team", "headcount", "engineer"];
+  const hasTeamSignal = teamKeywords.some((kw) => combined.includes(kw));
+
+  const pmfKeywords = ["launched", "pilot", "customers", "deploy", "live"];
+  const hasPmfSignal = pmfKeywords.some((kw) => combined.includes(kw));
+
+  const fundingEntry = timeline.find((entry) => entry.event_type === "funding");
+  const hasFundingSignal =
+    hasKeyword(signals, "funding") || Boolean(fundingEntry);
+
+  return {
+    marketSize: hasMarketSignal
+      ? "Customer/TAM references detected"
+      : "Unknown",
+    traction: tractionMentions
+      ? `${tractionMentions} public mentions`
+      : "Early — no public mentions",
+    teamQuality: hasTeamSignal ? "Active hiring signals" : "Unknown",
+    productMarketFit: hasPmfSignal ? "Launches & pilots reported" : "Unknown",
+    competitiveMoat: fallbackSector || "Unique positioning TBD",
+    fundingStatus: hasFundingSignal
+      ? fundingEntry?.description || "Recent funding activity"
+      : "Unknown",
+  };
+}
+
+function extractExperiencePoints(
+  content: string,
+  timeline: TimelineEntry[],
+): string[] {
+  const sentences = content
+    .split(/(?<=[.!?])\s+/)
+    .map((sentence) => sentence.trim())
+    .filter(Boolean);
+  const keywords = ["previously", "before", "led", "founded", "worked"];
+  const matched = sentences.filter((sentence) =>
+    keywords.some((kw) => sentence.toLowerCase().includes(kw)),
+  );
+  if (!matched.length) {
+    const timelineNotes = timeline
+      .filter((entry) => entry.event_type !== "signal")
+      .map((entry) => entry.description);
+    return dedupe(timelineNotes).slice(0, 5);
+  }
+  return dedupe(matched).slice(0, 5);
+}
+
+function hasKeyword(signals: HogSignal[], keyword: string): boolean {
+  return signals.some((signal) =>
+    signal.content.toLowerCase().includes(keyword.toLowerCase()),
+  );
 }
 
 interface HogSignal {
@@ -42,6 +131,22 @@ interface BrainLink {
   relation: string;
 }
 
+interface TimelineEntry {
+  timestamp: string;
+  event_type: string;
+  description: string;
+  source: string;
+  source_url?: string;
+  metadata?: Record<string, any>;
+}
+
+interface NodeDetail {
+  page: { content?: string; tags?: unknown } | null;
+  timeline: TimelineEntry[];
+  signals: HogSignal[];
+  contributors: any[];
+}
+
 interface GraphPayload {
   nodes: BrainNode[];
   links: BrainLink[];
@@ -58,6 +163,25 @@ const INITIAL_AGENT_MESSAGES: ChatMessage[] = [
     text: "I'm your VaultBrain agent. Drop content above—I'll route it through GStack, store results in GBrain, and enrich with The Hog.",
   },
 ];
+
+type OptimizationMode = "none" | "conservative" | "balanced" | "aggressive";
+
+interface TokenComparisonMetrics {
+  originalTokens: number;
+  optimizedTokens: number;
+  savings: number;
+  savingsPercent: number;
+  technique?: string;
+}
+
+interface TokenComparisonResult {
+  comparison: Record<OptimizationMode, TokenComparisonMetrics>;
+  examples: Record<string, string>;
+  recommendation: OptimizationMode;
+}
+
+const DEFAULT_TOKEN_TEXT =
+  "The Hog is a real-time web intelligence platform that streams signals about companies, founders, and market trends. It provides comprehensive data enrichment, competitive analysis, and investment insights for venture capital firms.";
 
 function App() {
   const [token, setToken] = useState<string | null>(
@@ -87,6 +211,17 @@ function App() {
   const [scannedCache, setScannedCache] = useState<Map<string, BrainNode>>(
     new Map(),
   );
+  const [nodeDetails, setNodeDetails] = useState<Record<string, NodeDetail>>(
+    {},
+  );
+  const [loadingNodeId, setLoadingNodeId] = useState<string | null>(null);
+  const [view, setView] = useState<
+    "brain" | "token" | "guide" | "session" | "collab"
+  >("brain");
+  const [tokenText, setTokenText] = useState(DEFAULT_TOKEN_TEXT);
+  const [tokenComparisonResult, setTokenComparisonResult] =
+    useState<TokenComparisonResult | null>(null);
+  const [tokenTesting, setTokenTesting] = useState(false);
 
   const graphRef = useRef<HTMLDivElement | null>(null);
   const [graphSize, setGraphSize] = useState({ width: 600, height: 320 });
@@ -118,6 +253,54 @@ function App() {
     }
   }, [token]);
 
+  const loadGraphData = useCallback(async () => {
+    if (!token) {
+      setGraphData({ nodes: [], links: [] });
+      return;
+    }
+
+    try {
+      const res = await fetch(`${API_URL}/api/pages`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) throw new Error("Failed to load saved entities");
+      const data = await res.json();
+      const nodes: BrainNode[] = (data.nodes || []).map((node: any) => {
+        const tags = parseStoredTags(node.tags);
+        const nodeType = node.slug.startsWith("company:")
+          ? "company"
+          : node.slug.startsWith("founder:")
+            ? "founder"
+            : node.type === "company"
+              ? "company"
+              : "founder";
+        const sector =
+          nodeType === "company" ? inferSector(node.slug, []) : undefined;
+        return {
+          id: node.slug,
+          label: node.title,
+          type: nodeType,
+          summary: node.content?.slice(0, 220) || "",
+          tags,
+          sector,
+          source: "gbrain",
+        };
+      });
+      const links: BrainLink[] = (data.links || []).map((link: any) => ({
+        source: link.from_slug,
+        target: link.to_slug,
+        relation: link.link_type,
+      }));
+      setGraphData({ nodes, links });
+    } catch (error) {
+      console.error("Failed to hydrate graph", error);
+    }
+  }, [token]);
+
+  useEffect(() => {
+    loadGraphData();
+  }, [loadGraphData]);
+
   useEffect(() => {
     localStorage.setItem("theme", theme);
     document.body.className = theme;
@@ -132,6 +315,108 @@ function App() {
     [graphData.nodes, selectedNodeId],
   );
 
+  const selectedDetail = selectedNodeId ? nodeDetails[selectedNodeId] : null;
+  const selectedSignals = selectedDetail?.signals?.length
+    ? selectedDetail.signals
+    : selectedNode?.signals || [];
+  const selectedTimeline = selectedDetail?.timeline || [];
+  const selectedSummaryText =
+    selectedDetail?.page?.content || selectedNode?.summary || "";
+  const hasDetail = selectedNodeId
+    ? Boolean(nodeDetails[selectedNodeId])
+    : false;
+
+  useEffect(() => {
+    if (!selectedNodeId || hasDetail || !token) return;
+    let cancelled = false;
+    setLoadingNodeId(selectedNodeId);
+
+    (async () => {
+      try {
+        const res = await fetch(
+          `${API_URL}/api/pages/${encodeURIComponent(selectedNodeId)}`,
+          {
+            headers: { Authorization: `Bearer ${token}` },
+          },
+        );
+        if (!res.ok) {
+          throw new Error("Failed to load node detail");
+        }
+        const data = await res.json();
+        if (cancelled) return;
+        setNodeDetails((prev) => ({ ...prev, [selectedNodeId]: data }));
+        setGraphData((prev) => ({
+          nodes: prev.nodes.map((node) =>
+            node.id === selectedNodeId
+              ? {
+                  ...node,
+                  summary:
+                    node.summary || data.page?.content?.slice(0, 220) || "",
+                  tags: node.tags?.length
+                    ? node.tags
+                    : parseStoredTags(data.page?.tags),
+                  signals: data.signals || node.signals,
+                }
+              : node,
+          ),
+          links: prev.links,
+        }));
+      } catch (detailError) {
+        console.error("Failed to fetch node detail", detailError);
+      } finally {
+        if (!cancelled) {
+          setLoadingNodeId(null);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedNodeId, token, hasDetail]);
+
+  const tagList = useMemo(() => {
+    const detailTags = selectedDetail?.page?.tags
+      ? parseStoredTags(selectedDetail.page.tags)
+      : [];
+    return dedupe([...(selectedNode?.tags || []), ...detailTags]);
+  }, [selectedDetail?.page?.tags, selectedNode?.tags]);
+
+  const investmentMetrics = useMemo(
+    () =>
+      selectedNode && selectedNode.type === "company"
+        ? computeInvestmentCriteria(
+            selectedSummaryText,
+            selectedTimeline,
+            selectedSignals,
+            selectedNode.sector,
+          )
+        : null,
+    [selectedNode, selectedSummaryText, selectedTimeline, selectedSignals],
+  );
+
+  const founderExperience = useMemo(
+    () =>
+      selectedNode && selectedNode.type === "founder"
+        ? extractExperiencePoints(selectedSummaryText, selectedTimeline)
+        : [],
+    [selectedNode, selectedSummaryText, selectedTimeline],
+  );
+
+  const linkedCompanies = useMemo(() => {
+    if (!selectedNode) return [];
+    const neighborIds = new Set<string>();
+    graphData.links.forEach((link) => {
+      const sourceId = normalizeLinkEndpoint((link as unknown as any).source);
+      const targetId = normalizeLinkEndpoint((link as unknown as any).target);
+      if (sourceId === selectedNode.id) neighborIds.add(targetId);
+      if (targetId === selectedNode.id) neighborIds.add(sourceId);
+    });
+    return graphData.nodes.filter(
+      (node) => neighborIds.has(node.id) && node.id !== selectedNode.id,
+    );
+  }, [graphData.links, graphData.nodes, selectedNode]);
+
   const founders = useMemo(
     () => graphData.nodes.filter((node) => node.type === "founder"),
     [graphData.nodes],
@@ -145,6 +430,53 @@ function App() {
     setMessages((prev) => [...prev, message]);
   }, []);
 
+  const persistNode = useCallback(
+    async (node: BrainNode) => {
+      if (!token) return;
+      try {
+        const content = node.summary || "";
+        const tags = node.tags || [];
+        const type = node.type || "note";
+        await fetch(`${API_URL}/api/pages/${encodeURIComponent(node.id)}`, {
+          method: "PUT",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            content: `---\ntype: ${type}\ntags: ${JSON.stringify(tags)}\n---\n\n${content}`,
+          }),
+        });
+      } catch (err) {
+        console.error("Failed to persist node", err);
+      }
+    },
+    [token],
+  );
+
+  const persistLink = useCallback(
+    async (link: BrainLink) => {
+      if (!token) return;
+      try {
+        await fetch(`${API_URL}/api/links`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            from_slug: link.source,
+            to_slug: link.target,
+            link_type: link.relation,
+          }),
+        });
+      } catch (err) {
+        console.error("Failed to persist link", err);
+      }
+    },
+    [token],
+  );
+
   const mergeGraphData = useCallback(
     (incomingNodes: BrainNode[], incomingLinks: BrainLink[]) => {
       if (!incomingNodes.length && !incomingLinks.length) return;
@@ -153,6 +485,7 @@ function App() {
         incomingNodes.forEach((node) => {
           const existing = nodeMap.get(node.id);
           nodeMap.set(node.id, mergeNode(existing, node));
+          persistNode(node);
         });
         const mergedLinks = [...prev.links];
         incomingLinks.forEach((link) => {
@@ -162,12 +495,15 @@ function App() {
               existing.target === link.target &&
               existing.relation === link.relation,
           );
-          if (!exists) mergedLinks.push(link);
+          if (!exists) {
+            mergedLinks.push(link);
+            persistLink(link);
+          }
         });
         return { nodes: Array.from(nodeMap.values()), links: mergedLinks };
       });
     },
-    [],
+    [persistNode, persistLink],
   );
 
   const login = async (e: React.FormEvent) => {
@@ -239,11 +575,19 @@ function App() {
     }
     const rawInput = (target ?? website).trim();
     if (!rawInput) {
-      setError("Enter a company website");
+      setError("Enter a company website or LinkedIn profile");
       return;
     }
 
     try {
+      // Detect if it's a LinkedIn profile
+      const isLinkedInProfile = /linkedin\.com\/in\/([^/]+)/i.test(rawInput);
+
+      if (isLinkedInProfile) {
+        await scanLinkedInProfile(rawInput);
+        return;
+      }
+
       const normalized = normalizeWebsite(rawInput);
       setWebsite(normalized.url);
       setError(null);
@@ -262,21 +606,43 @@ function App() {
       }
 
       setScanBusy(true);
-      const res = await fetch(`${API_URL}/api/hog/scan`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({ website: normalized.url }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.error || "Unable to scan website");
+
+      // Parallel fetch: Hog scan + web search for additional info
+      const [hogRes, enrichRes] = await Promise.allSettled([
+        fetch(`${API_URL}/api/hog/scan`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ website: normalized.url }),
+        }),
+        fetch(`${API_URL}/api/hog/enrich-company`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            company_name: titleFromDomain(normalized.domain),
+            website: normalized.url,
+          }),
+        }),
+      ]);
+
+      let signals: HogSignal[] = [];
+      let enrichedData: any = {};
+
+      if (hogRes.status === "fulfilled") {
+        const data = await hogRes.value.json();
+        if (hogRes.value.ok) {
+          signals = Array.isArray(data.signals) ? data.signals : [];
+        }
       }
-      const signals: HogSignal[] = Array.isArray(data.signals)
-        ? data.signals
-        : [];
+
+      if (enrichRes.status === "fulfilled" && enrichRes.value.ok) {
+        enrichedData = await enrichRes.value.json();
+      }
 
       // Infer sector from signals/domain
       const sector = inferSector(normalized.domain, signals);
@@ -284,13 +650,18 @@ function App() {
       const node: BrainNode = {
         id: nodeId,
         type: "company",
-        label: titleFromDomain(normalized.domain),
+        label: enrichedData.name || titleFromDomain(normalized.domain),
         website: normalized.url,
-        summary: `The Hog streamed ${signals.length} signal${signals.length === 1 ? "" : "s"} over the past 30 days.`,
-        tags: dedupe(signals.map((signal) => signal.source)),
+        summary:
+          enrichedData.description ||
+          `The Hog streamed ${signals.length} signal${signals.length === 1 ? "" : "s"} over the past 30 days.`,
+        tags: dedupe([
+          ...signals.map((signal) => signal.source),
+          ...(enrichedData.tags || []),
+        ]),
         signals,
         source: "hog",
-        sector,
+        sector: enrichedData.sector || sector,
       };
 
       // Cache the result
@@ -304,6 +675,99 @@ function App() {
       });
     } catch (err: any) {
       setError(err.message || "Scan failed");
+    } finally {
+      setScanBusy(false);
+    }
+  };
+
+  const scanLinkedInProfile = async (linkedinUrl: string) => {
+    setScanBusy(true);
+    setError(null);
+
+    try {
+      const match = linkedinUrl.match(/linkedin\.com\/in\/([^/]+)/);
+      const username = match ? match[1] : "unknown";
+      const founderName = username
+        .replace(/-/g, " ")
+        .replace(/\b\w/g, (c) => c.toUpperCase());
+      const founderId = `founder:${slugify(founderName)}`;
+
+      // Check cache
+      const cached = scannedCache.get(founderId);
+      if (cached) {
+        mergeGraphData([cached], []);
+        setSelectedNodeId(founderId);
+        addMessage({
+          role: "agent",
+          text: `Loaded ${cached.label} from cache.`,
+        });
+        setScanBusy(false);
+        return;
+      }
+
+      // Call backend to enrich LinkedIn profile
+      const res = await fetch(`${API_URL}/api/hog/enrich-person`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ linkedin_url: linkedinUrl }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || "Unable to enrich profile");
+      }
+
+      const signals: HogSignal[] = Array.isArray(data.signals)
+        ? data.signals
+        : [];
+      const founderNode: BrainNode = {
+        id: founderId,
+        type: "founder",
+        label: data.name || founderName,
+        summary: data.bio || `LinkedIn: ${linkedinUrl}`,
+        tags: data.skills || [],
+        signals,
+        source: "hog",
+      };
+
+      // Check if founder is associated with a company
+      if (data.current_company) {
+        const companyId = `company:${slugify(data.current_company)}`;
+        const companyNode: BrainNode = {
+          id: companyId,
+          type: "company",
+          label: data.current_company,
+          summary: `${founderNode.label}'s current company`,
+          source: "hog",
+        };
+        mergeGraphData(
+          [founderNode, companyNode],
+          [
+            {
+              source: founderId,
+              target: companyId,
+              relation: "works_at",
+            },
+          ],
+        );
+        setScannedCache((prev) =>
+          new Map(prev).set(founderId, founderNode).set(companyId, companyNode),
+        );
+      } else {
+        mergeGraphData([founderNode], []);
+        setScannedCache((prev) => new Map(prev).set(founderId, founderNode));
+      }
+
+      setSelectedNodeId(founderId);
+      addMessage({
+        role: "agent",
+        text: `Enriched ${founderNode.label} with ${signals.length} signal${signals.length === 1 ? "" : "s"}.`,
+      });
+    } catch (err: any) {
+      setError(err.message || "Profile enrichment failed");
     } finally {
       setScanBusy(false);
     }
@@ -324,13 +788,117 @@ function App() {
     [companies.length, founders.length, selectedNode],
   );
 
-  const handleSendAgentMessage = () => {
-    if (!agentInput.trim()) return;
-    const prompt = agentInput.trim();
+  const handleSendAgentMessage = (preset?: string) => {
+    const prompt = (preset ?? agentInput).trim();
+    if (!prompt) return;
+    if (!preset) {
+      setAgentInput("");
+    }
     addMessage({ role: "user", text: prompt });
-    setAgentInput("");
     setTimeout(() => respondWithSummary(prompt), 400);
   };
+
+  const runTokenComparison = useCallback(async () => {
+    if (!token) return;
+    try {
+      setTokenTesting(true);
+      const sampleText = tokenText.trim() || DEFAULT_TOKEN_TEXT;
+      const res = await fetch(`${API_URL}/api/optimization/compare`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ text: sampleText }),
+      });
+
+      if (!res.ok) {
+        throw new Error("Failed to compare token optimization modes");
+      }
+
+      const result: TokenComparisonResult = await res.json();
+      setTokenComparisonResult(result);
+    } catch (err) {
+      console.error("Token optimization test failed", err);
+    } finally {
+      setTokenTesting(false);
+    }
+  }, [token, tokenText]);
+
+  const renderHeader = () => (
+    <header className="brain-header">
+      <div className="logo">
+        <span className="logo-mark">⬡</span>
+        <div>
+          <p className="logo-title">VaultBrain</p>
+          <p className="logo-tag">GBrain × GStack × The Hog</p>
+        </div>
+      </div>
+      <div className="header-actions">
+        <button
+          className="ghost-btn"
+          onClick={toggleTheme}
+          title={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
+        >
+          {theme === "dark" ? "☀️" : "🌙"}
+        </button>
+        <span className="user-chip">
+          {user?.name} · {user?.role}
+        </span>
+        {view !== "brain" && (
+          <button className="ghost-btn" onClick={() => setView("brain")}>
+            ← Brain
+          </button>
+        )}
+        {view === "brain" && (
+          <>
+            <button
+              className="ghost-btn"
+              onClick={() => {
+                setView("token");
+                setTokenTesting(false);
+                runTokenComparison();
+              }}
+              title="Token optimization lab"
+            >
+              🔬 Token Test
+            </button>
+            <button
+              className="ghost-btn"
+              onClick={() => setView("guide")}
+              title="Team collaboration guide"
+            >
+              📖 Guide
+            </button>
+            <button
+              className="ghost-btn"
+              onClick={() => setView("session")}
+              title="Team discussion session"
+            >
+              🧑‍💻 Session
+            </button>
+            <button
+              className="ghost-btn"
+              onClick={() => setView("collab")}
+              title="Collaborative research pad"
+            >
+              📝 Collab Pad
+            </button>
+          </>
+        )}
+        <button
+          className="ghost-btn"
+          onClick={() => {
+            setToken(null);
+            localStorage.removeItem("token");
+            setView("brain");
+          }}
+        >
+          Logout
+        </button>
+      </div>
+    </header>
+  );
 
   if (!token) {
     return (
@@ -358,38 +926,146 @@ function App() {
     );
   }
 
+  if (view === "token") {
+    const baseline = tokenComparisonResult?.comparison.none;
+    const recommendedKey: OptimizationMode | undefined =
+      tokenComparisonResult?.recommendation;
+    const optimized = recommendedKey
+      ? tokenComparisonResult?.comparison[recommendedKey]
+      : tokenComparisonResult?.comparison.balanced;
+
+    return (
+      <div className={`brain-app ${theme}`}>
+        {renderHeader()}
+        <main className="token-lab">
+          <section className="token-hero">
+            <div>
+              <p className="panel-label">Token Optimization Lab</p>
+              <h1>Back-to-back comparison</h1>
+              <p>
+                Measure how the optimization layer compresses prompts before
+                they hit GStack. Paste any memo or meeting note to compare.
+              </p>
+            </div>
+            {optimized && (
+              <div className="token-highlight">
+                <p className="metric-label">Recommended mode</p>
+                <p className="metric-value">{recommendedKey ?? "balanced"}</p>
+                <p className="metric-sub">
+                  {optimized.savingsPercent.toFixed(1)}% average savings
+                </p>
+              </div>
+            )}
+          </section>
+
+          <section className="token-input">
+            <textarea
+              value={tokenText}
+              onChange={(event) => setTokenText(event.target.value)}
+              rows={10}
+            />
+            <button
+              className="primary-btn"
+              onClick={() => runTokenComparison()}
+              disabled={tokenTesting}
+            >
+              {tokenTesting ? "Calculating…" : "Run comparison"}
+            </button>
+          </section>
+
+          {tokenComparisonResult && baseline && optimized && (
+            <>
+              <section className="token-side-by-side">
+                <div className="token-card baseline">
+                  <p className="pill subtle">Without optimization</p>
+                  <h3>{baseline.originalTokens} tokens</h3>
+                  <p className="token-snippet">
+                    {tokenComparisonResult.examples.original}
+                  </p>
+                </div>
+                <div className="token-card optimized">
+                  <p className="pill subtle">With optimization layer</p>
+                  <h3>{optimized.optimizedTokens} tokens</h3>
+                  <p className="token-savings">
+                    Saved {optimized.savingsPercent.toFixed(1)}% of context
+                  </p>
+                  <p className="token-snippet">
+                    {
+                      tokenComparisonResult.examples[
+                        recommendedKey || "balanced"
+                      ]
+                    }
+                  </p>
+                </div>
+              </section>
+
+              <section className="token-modes">
+                <h3>Mode breakdown</h3>
+                <div className="token-grid">
+                  {Object.entries(tokenComparisonResult.comparison).map(
+                    ([mode, metrics]) => (
+                      <div key={mode} className="token-card mini">
+                        <p className="mode-label">{mode}</p>
+                        <p className="mode-tokens">
+                          {metrics.optimizedTokens} tokens
+                        </p>
+                        <p className="mode-savings">
+                          {metrics.savingsPercent.toFixed(1)}% saved
+                        </p>
+                      </div>
+                    ),
+                  )}
+                </div>
+              </section>
+            </>
+          )}
+        </main>
+      </div>
+    );
+  }
+
+  if (view === "guide") {
+    return (
+      <div className={`brain-app ${theme}`}>
+        {renderHeader()}
+        <InstructionPage onBack={() => setView("brain")} />
+      </div>
+    );
+  }
+
+  if (view === "session") {
+    const sessionEntities = graphData.nodes.map((n) => ({
+      id: n.id,
+      label: n.label,
+      type: n.type as "company" | "founder",
+    }));
+    return (
+      <div className={`brain-app ${theme}`}>
+        {renderHeader()}
+        <TeamSessionPage
+          onBack={() => setView("brain")}
+          entities={sessionEntities}
+        />
+      </div>
+    );
+  }
+
+  if (view === "collab") {
+    return (
+      <div className={`brain-app ${theme}`}>
+        {renderHeader()}
+        <CollabPadPage
+          onBack={() => setView("brain")}
+          token={token}
+          apiUrl={API_URL}
+        />
+      </div>
+    );
+  }
+
   return (
     <div className={`brain-app ${theme}`}>
-      <header className="brain-header">
-        <div className="logo">
-          <span className="logo-mark">⬡</span>
-          <div>
-            <p className="logo-title">VaultBrain</p>
-            <p className="logo-tag">GBrain × GStack × The Hog</p>
-          </div>
-        </div>
-        <div className="header-actions">
-          <button
-            className="ghost-btn"
-            onClick={toggleTheme}
-            title={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
-          >
-            {theme === "dark" ? "☀️" : "🌙"}
-          </button>
-          <span className="user-chip">
-            {user?.name} · {user?.role}
-          </span>
-          <button
-            className="ghost-btn"
-            onClick={() => {
-              setToken(null);
-              localStorage.removeItem("token");
-            }}
-          >
-            Logout
-          </button>
-        </div>
-      </header>
+      {renderHeader()}
 
       <div className="brain-layout">
         <aside className="brain-sidebar">
@@ -527,14 +1203,17 @@ function App() {
                   type="url"
                   value={website}
                   onChange={(event) => setWebsite(event.target.value)}
-                  placeholder="https://company.com"
+                  placeholder="https://company.com or linkedin.com/in/username"
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") scanWebsite();
+                  }}
                 />
                 <button
                   className="ghost-btn"
                   onClick={() => scanWebsite()}
                   disabled={scanBusy}
                 >
-                  {scanBusy ? "Scanning…" : "Scan with The Hog"}
+                  {scanBusy ? "Scanning…" : "Enrich with The Hog"}
                 </button>
               </div>
             </div>
@@ -574,7 +1253,7 @@ function App() {
                     ctx.beginPath();
                     ctx.arc(node.x ?? 0, node.y ?? 0, 5, 0, Math.PI * 2);
                     ctx.fill();
-                    ctx.fillStyle = "#dee4fd";
+                    ctx.fillStyle = "#ffffff";
                     ctx.fillText(label, (node.x ?? 0) + 8, (node.y ?? 0) + 4);
                   }}
                   onNodeClick={(node: NodeObject<BrainNode>) => {
@@ -600,10 +1279,15 @@ function App() {
                     <h2>{selectedNode.label}</h2>
                     <p className="card-sub">
                       {selectedNode.type === "company"
-                        ? selectedNode.sector || "Unknown sector"
+                        ? selectedNode.sector ||
+                          investmentMetrics?.competitiveMoat ||
+                          "Unknown sector"
                         : selectedNode.stage || ""}
                     </p>
                   </div>
+                  {loadingNodeId === selectedNode.id && (
+                    <span className="pill subtle">Refreshing…</span>
+                  )}
                   {selectedNode.type === "company" && selectedNode.website && (
                     <button
                       className="ghost-btn"
@@ -618,14 +1302,14 @@ function App() {
                   <div>
                     <p className="field-label">Summary</p>
                     <p className="field-value">
-                      {selectedNode.summary || "No summary yet"}
+                      {selectedSummaryText || "No summary yet"}
                     </p>
                   </div>
                   <div>
                     <p className="field-label">Tags</p>
                     <div className="tags-row">
-                      {selectedNode.tags?.length
-                        ? selectedNode.tags.map((tag) => (
+                      {tagList.length
+                        ? tagList.map((tag) => (
                             <span key={tag} className="tag-chip">
                               {tag}
                             </span>
@@ -654,81 +1338,124 @@ function App() {
                   )}
                 </div>
                 {/* VC-focused metrics */}
-                {selectedNode.type === "company" && (
+                {selectedNode.type === "company" && investmentMetrics && (
                   <div className="vc-metrics">
                     <h4>VC Investment Criteria</h4>
                     <div className="metric-grid">
                       <div className="metric-item">
                         <p className="metric-label">Market Size</p>
                         <p className="metric-value">
-                          {selectedNode.signals?.some((s) =>
-                            s.content.toLowerCase().includes("market"),
-                          )
-                            ? "Large TAM signals detected"
-                            : "Unknown"}
+                          {investmentMetrics.marketSize}
                         </p>
                       </div>
                       <div className="metric-item">
                         <p className="metric-label">Traction</p>
                         <p className="metric-value">
-                          {selectedNode.signals?.filter(
-                            (s) => s.type === "mentions",
-                          ).length || 0}{" "}
-                          mentions
+                          {investmentMetrics.traction}
                         </p>
                       </div>
                       <div className="metric-item">
                         <p className="metric-label">Team Quality</p>
                         <p className="metric-value">
-                          {selectedNode.signals?.some(
-                            (s) =>
-                              s.content.toLowerCase().includes("hire") ||
-                              s.content.toLowerCase().includes("team"),
-                          )
-                            ? "Hiring activity detected"
-                            : "Unknown"}
+                          {investmentMetrics.teamQuality}
                         </p>
                       </div>
                       <div className="metric-item">
                         <p className="metric-label">Product/Market Fit</p>
                         <p className="metric-value">
-                          {selectedNode.signals?.some(
-                            (s) => s.type === "product",
-                          )
-                            ? "Product signals found"
-                            : "Unknown"}
+                          {investmentMetrics.productMarketFit}
                         </p>
                       </div>
                       <div className="metric-item">
                         <p className="metric-label">Competitive Moat</p>
                         <p className="metric-value">
-                          {selectedNode.sector || "Unknown sector"}
+                          {investmentMetrics.competitiveMoat}
                         </p>
                       </div>
                       <div className="metric-item">
                         <p className="metric-label">Funding Status</p>
                         <p className="metric-value">
-                          {selectedNode.signals?.some(
-                            (s) => s.type === "funding",
-                          )
-                            ? "Recent funding activity"
-                            : selectedNode.stage || "Unknown"}
+                          {investmentMetrics.fundingStatus}
                         </p>
                       </div>
                     </div>
                   </div>
                 )}
 
+                {selectedNode.type === "founder" && (
+                  <div className="founder-panel">
+                    <h4>Founder Focus</h4>
+                    <div>
+                      <p className="field-label">Experience</p>
+                      {founderExperience.length ? (
+                        <ul className="experience-list">
+                          {founderExperience.map((point: string) => (
+                            <li key={point}>{point}</li>
+                          ))}
+                        </ul>
+                      ) : (
+                        <p className="muted">No experience extracted yet.</p>
+                      )}
+                    </div>
+                    <div>
+                      <p className="field-label">Linked Companies</p>
+                      {linkedCompanies.length ? (
+                        <div className="linked-row">
+                          {linkedCompanies.map((company) => (
+                            <button
+                              key={company.id}
+                              className="linked-pill"
+                              onClick={() => setSelectedNodeId(company.id)}
+                            >
+                              {company.label}
+                            </button>
+                          ))}
+                        </div>
+                      ) : (
+                        <p className="muted">No linked companies recorded.</p>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                <div className="timeline-block">
+                  <div className="signals-header">
+                    <h4>Timeline</h4>
+                    <span className="pill small">
+                      {selectedTimeline.length} entries
+                    </span>
+                  </div>
+                  {selectedTimeline.length ? (
+                    <ul className="timeline-list">
+                      {selectedTimeline.map((entry) => (
+                        <li key={`${entry.event_type}-${entry.timestamp}`}>
+                          <div className="timeline-meta">
+                            <span>
+                              {new Date(entry.timestamp).toLocaleDateString()}
+                            </span>
+                            <span className="pill ghost">
+                              {entry.event_type}
+                            </span>
+                          </div>
+                          <p>{entry.description}</p>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="muted">No timeline updates yet.</p>
+                  )}
+                </div>
+
                 <div className="signals-block">
                   <div className="signals-header">
                     <h4>Signals feed</h4>
                     <span className="pill small">
-                      {selectedNode.signals?.length || 0} entries
+                      {selectedSignals.length} entries
                     </span>
                   </div>
-                  {selectedNode.signals?.length ? (
+                  {selectedSignals.length ? (
                     <div className="signal-list">
-                      {selectedNode.signals.map((signal, index) => (
+                      {selectedSignals.map((signal, index) => (
                         <article
                           key={`${signal.source}-${index}`}
                           className="signal-card"
@@ -801,41 +1528,56 @@ function App() {
               <span>Streaming via GStack</span>
             </div>
           </div>
+          <div className="agent-input-row">
+            <input
+              type="text"
+              placeholder="Ask the brain anything…"
+              value={agentInput}
+              onChange={(event) => setAgentInput(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  handleSendAgentMessage();
+                }
+              }}
+            />
+            <button
+              className="primary-btn"
+              onClick={() => handleSendAgentMessage()}
+              disabled={!agentInput.trim()}
+            >
+              ↑
+            </button>
+          </div>
           <div className="quick-asks">
             <button
-              onClick={() => {
-                const prompt = "Who's most active in our pipeline?";
-                setAgentInput(prompt);
-                handleSendAgentMessage();
-              }}
+              onClick={() =>
+                handleSendAgentMessage("Who's most active in our pipeline?")
+              }
             >
               Who's most active?
             </button>
             <button
-              onClick={() => {
-                const prompt = "What signals has The Hog found this week?";
-                setAgentInput(prompt);
-                handleSendAgentMessage();
-              }}
+              onClick={() =>
+                handleSendAgentMessage(
+                  "What signals has The Hog found this week?",
+                )
+              }
             >
               Hog signals
             </button>
             <button
-              onClick={() => {
-                const prompt =
-                  "Summarize everything we know about our top founders";
-                setAgentInput(prompt);
-                handleSendAgentMessage();
-              }}
+              onClick={() =>
+                handleSendAgentMessage(
+                  "Summarize everything we know about our top founders",
+                )
+              }
             >
               Summaries
             </button>
             <button
-              onClick={() => {
-                const prompt = "What warm intro paths exist right now?";
-                setAgentInput(prompt);
-                handleSendAgentMessage();
-              }}
+              onClick={() =>
+                handleSendAgentMessage("What warm intro paths exist right now?")
+              }
             >
               Warm paths
             </button>
@@ -847,23 +1589,6 @@ function App() {
                 <p>{message.text}</p>
               </div>
             ))}
-          </div>
-          <div className="agent-input-row">
-            <textarea
-              rows={2}
-              placeholder="Ask the brain anything..."
-              value={agentInput}
-              onChange={(event) => setAgentInput(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.shiftKey) {
-                  event.preventDefault();
-                  handleSendAgentMessage();
-                }
-              }}
-            />
-            <button className="primary-btn" onClick={handleSendAgentMessage}>
-              ↑
-            </button>
           </div>
         </aside>
       </div>
@@ -897,8 +1622,34 @@ function titleFromDomain(domain: string): string {
     .replace(/\b\w/g, (match) => match.toUpperCase());
 }
 
+function parseStoredTags(raw: unknown): string[] {
+  if (!raw) return [];
+  if (Array.isArray(raw)) return raw.filter(Boolean);
+  if (typeof raw === "string") {
+    try {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        return parsed.filter(Boolean);
+      }
+    } catch {
+      return raw
+        .split(/[,|]/)
+        .map((value) => value.trim())
+        .filter(Boolean);
+    }
+  }
+  return [];
+}
+
 function dedupe<T>(values: T[]): T[] {
   return Array.from(new Set(values.filter(Boolean)));
+}
+
+function normalizeLinkEndpoint(value: any): string {
+  if (!value) return "";
+  if (typeof value === "string") return value;
+  if (typeof value === "object" && value.id) return value.id;
+  return "";
 }
 
 function inferSector(domain: string, signals: HogSignal[]): string {

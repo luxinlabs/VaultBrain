@@ -6,6 +6,15 @@ import { authMiddleware } from '../middleware/auth';
 const router = Router();
 router.use(authMiddleware);
 
+router.get('/', (req, res) => {
+  try {
+    const graph = gbrainService.getGraph(req.user);
+    res.json(graph);
+  } catch (e: any) {
+    res.status(500).json({ error: e.message || 'Failed to load pages' });
+  }
+});
+
 router.get('/:slug', (req, res) => {
   try {
     const page = gbrainService.getPage(req.params.slug, req.user);

@@ -3,6 +3,8 @@ import cors from 'cors';
 import authRoutes from './api/auth';
 import pagesRoutes from './api/pages';
 import hogRoutes from './api/hog';
+import optimizationRoutes from './api/optimization';
+import linksRoutes from './api/links';
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -15,6 +17,8 @@ app.use(express.json());
 app.use('/api/auth', authRoutes);
 app.use('/api/pages', pagesRoutes);
 app.use('/api/hog', hogRoutes);
+app.use('/api/optimization', optimizationRoutes);
+app.use('/api/links', linksRoutes);
 
 // Health check
 app.get('/health', (req, res) => {

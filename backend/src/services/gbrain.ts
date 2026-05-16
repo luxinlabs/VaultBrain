@@ -46,6 +46,30 @@ export class GBrainService {
     return queryOne('SELECT * FROM timeline_entries WHERE id=last_insert_rowid()');
   }
 
+  listPages(user: User, limit = 250): any[] {
+    if (user.role === 'partner') {
+      return query('SELECT * FROM pages ORDER BY updated_at DESC LIMIT ?', limit);
+    }
+
+    return query(
+      `SELECT p.* FROM pages p
+       JOIN analyst_assignments a ON a.page_slug = p.slug
+       WHERE a.analyst_id = ?
+       ORDER BY p.updated_at DESC
+       LIMIT ?`,
+      user.id,
+      limit,
+    );
+  }
+
+  getGraph(user: User): { nodes: any[]; links: any[] } {
+    const nodes = this.listPages(user);
+    const allowed = new Set(nodes.map((p: any) => p.slug));
+    const rawLinks = query('SELECT * FROM entity_links ORDER BY created_at DESC LIMIT 500');
+    const links = rawLinks.filter((link: any) => allowed.has(link.from_slug) && allowed.has(link.to_slug));
+    return { nodes, links };
+  }
+
   getContributors(slug: string, user: User): any[] {
     permissionsService.checkReadPermission(slug, user);
     return query('SELECT u.id,u.name,u.email,u.role,pc.contribution_type,pc.timestamp,pc.source FROM page_contributions pc JOIN dealflow_users u ON pc.user_id=u.id WHERE pc.page_slug=? ORDER BY pc.timestamp DESC', slug);

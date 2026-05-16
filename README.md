@@ -354,22 +354,6 @@ cd frontend && rm -rf node_modules && npm install
 
 ---
 
-## Hackathon Checklist
-
-- [x] Clone gstack and gbrain
-- [x] Create skills for gstack, gbrain, The Hog
-- [x] Design system architecture
-- [x] Implement shared GBrain backend
-- [x] Implement The Hog integration
-- [x] Create entity merge logic
-- [x] Build permissions system
-- [ ] Build React frontend
-- [ ] Seed demo data
-- [ ] Test end-to-end workflow
-- [ ] Prepare demo
-
----
-
 ## License
 
 MIT

@@ -45,9 +45,18 @@ export class HogConnector {
 
   private normalizeWebsite(raw: string): { url: string; domain: string } {
     const trimmed = raw.trim();
-    const withProtocol = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
-    const parsed = new URL(withProtocol);
-    return { url: parsed.origin, domain: parsed.hostname };
+    // Decode URL-encoded characters (e.g., %20 -> space)
+    const decoded = decodeURIComponent(trimmed);
+    // Replace spaces with nothing (common user error: "garry tan" -> "garrytan")
+    const withoutSpaces = decoded.replace(/\s+/g, '');
+    const withProtocol = /^https?:\/\//i.test(withoutSpaces) ? withoutSpaces : `https://${withoutSpaces}`;
+
+    try {
+      const parsed = new URL(withProtocol);
+      return { url: parsed.origin, domain: parsed.hostname };
+    } catch (e) {
+      throw new Error(`Invalid URL: "${raw}". Please enter a valid website URL.`);
+    }
   }
 
   async scan(entity: string, entityType: string, extraBody: Record<string, any> = {}): Promise<HogScanResponse> {
@@ -133,6 +142,60 @@ export class HogConnector {
     const normalized = this.normalizeWebsite(website);
     const data = await this.scan(normalized.url, 'company');
     return { ...data, website: normalized.url, domain: normalized.domain };
+  }
+
+  async enrichPerson(linkedinUrl: string): Promise<any> {
+    const { accessKey, secretKey } = this.ensureApiKeys();
+    
+    for (const endpoint of this.endpoints) {
+      const url = `${endpoint.baseUrl}/api/enrichments`;
+      const payload = {
+        identifier: { linkedin_url: linkedinUrl },
+        fields: ['contact.email', 'contact.phone', 'person.name', 'person.bio', 'person.current_company', 'person.skills', 'signals']
+      };
+
+      console.log('🐗 Hog person enrichment:', { url, linkedinUrl, endpoint: endpoint.label });
+
+      try {
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'X-Access-Key': accessKey,
+            'X-Secret-Key': secretKey,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify(payload)
+        });
+
+        const text = await response.text();
+        if (!response.ok) {
+          console.warn(`⚠️ Hog enrichment failed (${endpoint.label}): ${text}`);
+          continue;
+        }
+
+        const contentType = response.headers.get('content-type') || '';
+        if (!/json/i.test(contentType)) {
+          console.warn(`⚠️ Non-JSON response from ${endpoint.label}`);
+          continue;
+        }
+
+        const data = JSON.parse(text);
+        return {
+          name: data.person?.name || null,
+          bio: data.person?.bio || null,
+          current_company: data.person?.current_company || null,
+          skills: data.person?.skills || [],
+          email: data.contact?.email || null,
+          phone: data.contact?.phone || null,
+          signals: data.signals || []
+        };
+      } catch (error) {
+        console.warn(`⚠️ Hog enrichment error (${endpoint.label}):`, error);
+        continue;
+      }
+    }
+
+    throw new Error('All Hog enrichment endpoints failed');
   }
 
   async enrichPage(slug: string, name: string, type: string): Promise<void> {

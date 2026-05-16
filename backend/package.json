@@ -7,7 +7,8 @@
     "dev": "bun --watch src/index.ts",
     "start": "bun src/index.ts",
     "db:setup": "bun src/db/setup.ts",
-    "db:seed": "bun src/db/seed.ts"
+    "db:seed": "bun src/db/seed.ts",
+    "db:seed:pages": "bun src/db/seed_pages.ts"
   },
   "dependencies": {
     "express": "^4.18.2",

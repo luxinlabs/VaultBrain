@@ -1,21 +1,48 @@
 import { Router } from 'express';
-import { authMiddleware } from '../middleware/auth';
 import { hogConnector } from '../services/hog-connector';
+import { authMiddleware } from '../middleware/auth';
 
 const router = Router();
-router.use(authMiddleware);
 
-router.post('/scan', async (req, res) => {
-  const { website } = req.body ?? {};
-  if (!website || typeof website !== 'string') {
-    return res.status(400).json({ error: 'website is required' });
-  }
-
+router.post('/scan', authMiddleware, async (req, res) => {
   try {
+    const { website } = req.body;
+    if (!website) {
+      return res.status(400).json({ error: 'website is required' });
+    }
     const result = await hogConnector.scanWebsite(website);
     res.json(result);
-  } catch (e: any) {
-    res.status(502).json({ error: e.message || 'Failed to scan website with The Hog' });
+  } catch (error: any) {
+    console.error('Hog scan error:', error);
+    res.status(502).json({ error: error.message || 'The Hog scan failed' });
+  }
+});
+
+router.post('/enrich-person', authMiddleware, async (req, res) => {
+  try {
+    const { linkedin_url } = req.body;
+    if (!linkedin_url) {
+      return res.status(400).json({ error: 'linkedin_url is required' });
+    }
+    const result = await hogConnector.enrichPerson(linkedin_url);
+    res.json(result);
+  } catch (error: any) {
+    console.error('Person enrichment error:', error);
+    res.status(502).json({ error: error.message || 'Person enrichment failed' });
+  }
+});
+
+router.post('/enrich-company', authMiddleware, async (req, res) => {
+  try {
+    const { website } = req.body;
+    if (!website) {
+      return res.status(400).json({ error: 'website is required' });
+    }
+    const result = await hogConnector.scanWebsite(website);
+    res.json(result);
+  } catch (error: any) {
+    console.error('Company enrichment error:', error);
+    res.status(502).json({ error: error.message || 'Company enrichment failed' });
   }
 });
 
