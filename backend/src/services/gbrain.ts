@@ -8,6 +8,16 @@ export class GBrainService {
     return queryOne('SELECT * FROM pages WHERE slug = ?', slug);
   }
 
+  deletePage(slug: string, user: User): void {
+    permissionsService.checkWritePermission(slug, user);
+    query('DELETE FROM entity_links WHERE from_slug=? OR to_slug=?', slug, slug);
+    query('DELETE FROM hog_signals WHERE entity_slug=?', slug);
+    query('DELETE FROM timeline_entries WHERE page_slug=?', slug);
+    query('DELETE FROM page_contributions WHERE page_slug=?', slug);
+    query('DELETE FROM analyst_assignments WHERE page_slug=?', slug);
+    query('DELETE FROM pages WHERE slug=?', slug);
+  }
+
   putPage(slug: string, content: string, user: User): any {
     const existing = queryOne('SELECT * FROM pages WHERE slug = ?', slug);
     if (existing) {

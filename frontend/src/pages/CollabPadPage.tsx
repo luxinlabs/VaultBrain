@@ -91,7 +91,11 @@ const SAMPLE_PAD = `# Research Session - [Date]
 - [ ] Check references
 `;
 
-export default function CollabPadPage({ onBack, token, apiUrl }: Props) {
+export default function CollabPadPage({
+  onBack,
+  token: _token,
+  apiUrl: _apiUrl,
+}: Props) {
   const [content, setContent] = useState(SAMPLE_PAD);
   const [preview, setPreview] = useState(false);
   const [responses, setResponses] = useState<AgentResponse[]>([]);

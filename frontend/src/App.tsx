@@ -14,6 +14,15 @@ interface User {
   role: "partner" | "analyst";
 }
 
+interface InvestmentCriteria {
+  marketSize: string;
+  traction: string;
+  teamQuality: string;
+  productMarketFit: string;
+  competitiveMoat: string;
+  fundingStatus: string;
+}
+
 function computeInvestmentCriteria(
   content: string,
   timeline: TimelineEntry[],
@@ -123,6 +132,8 @@ interface BrainNode {
   lastContact?: string;
   signals?: HogSignal[];
   source?: "user" | "hog" | "gbrain";
+  investmentInsights?: InvestmentCriteria;
+  timeline?: TimelineEntry[];
 }
 
 interface BrainLink {
@@ -191,6 +202,13 @@ function App() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [website, setWebsite] = useState("https://thehog.ai");
+  const [hogSearchMode, setHogSearchMode] = useState<"company" | "people">(
+    "company",
+  );
+  const [hogResults, setHogResults] = useState<{
+    type: "company" | "people";
+    items: any[];
+  } | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [ingestBusy, setIngestBusy] = useState(false);
   const [scanBusy, setScanBusy] = useState(false);
@@ -206,7 +224,7 @@ function App() {
   );
   const [agentInput, setAgentInput] = useState("");
   const [theme, setTheme] = useState<"light" | "dark">(
-    (localStorage.getItem("theme") as "light" | "dark") || "dark",
+    (localStorage.getItem("theme") as "light" | "dark") || "light",
   );
   const [scannedCache, setScannedCache] = useState<Map<string, BrainNode>>(
     new Map(),
@@ -280,7 +298,7 @@ function App() {
           id: node.slug,
           label: node.title,
           type: nodeType,
-          summary: node.content?.slice(0, 220) || "",
+          summary: stripFrontmatter(node.content || "").slice(0, 220),
           tags,
           sector,
           source: "gbrain",
@@ -382,18 +400,16 @@ function App() {
     return dedupe([...(selectedNode?.tags || []), ...detailTags]);
   }, [selectedDetail?.page?.tags, selectedNode?.tags]);
 
-  const investmentMetrics = useMemo(
-    () =>
-      selectedNode && selectedNode.type === "company"
-        ? computeInvestmentCriteria(
-            selectedSummaryText,
-            selectedTimeline,
-            selectedSignals,
-            selectedNode.sector,
-          )
-        : null,
-    [selectedNode, selectedSummaryText, selectedTimeline, selectedSignals],
-  );
+  const investmentMetrics = useMemo(() => {
+    if (!selectedNode || selectedNode.type !== "company") return null;
+    if (selectedNode.investmentInsights) return selectedNode.investmentInsights;
+    return computeInvestmentCriteria(
+      selectedSummaryText,
+      selectedTimeline,
+      selectedSignals,
+      selectedNode.sector,
+    );
+  }, [selectedNode, selectedSummaryText, selectedTimeline, selectedSignals]);
 
   const founderExperience = useMemo(
     () =>
@@ -437,6 +453,7 @@ function App() {
         const content = node.summary || "";
         const tags = node.tags || [];
         const type = node.type || "note";
+        const title = node.label || node.id;
         await fetch(`${API_URL}/api/pages/${encodeURIComponent(node.id)}`, {
           method: "PUT",
           headers: {
@@ -444,7 +461,7 @@ function App() {
             Authorization: `Bearer ${token}`,
           },
           body: JSON.stringify({
-            content: `---\ntype: ${type}\ntags: ${JSON.stringify(tags)}\n---\n\n${content}`,
+            content: `---\ntype: ${type}\ntitle: ${title}\ntags: ${JSON.stringify(tags)}\n---\n\n${content}`,
           }),
         });
       } catch (err) {
@@ -452,6 +469,84 @@ function App() {
       }
     },
     [token],
+  );
+
+  const handleDeleteEntity = useCallback(
+    async (node: BrainNode) => {
+      if (!token) return;
+      const label = node.label || node.id;
+      const confirmed = window.confirm(
+        `Delete "${label}"? This removes the entity, links, and signals.`,
+      );
+      if (!confirmed) return;
+      try {
+        const res = await fetch(
+          `${API_URL}/api/pages/${encodeURIComponent(node.id)}`,
+          {
+            method: "DELETE",
+            headers: { Authorization: `Bearer ${token}` },
+          },
+        );
+        if (!res.ok) {
+          throw new Error("Failed to delete entity");
+        }
+        setGraphData((prev) => ({
+          nodes: prev.nodes.filter((n) => n.id !== node.id),
+          links: prev.links.filter(
+            (link) =>
+              normalizeLinkEndpoint(link.source) !== node.id &&
+              normalizeLinkEndpoint(link.target) !== node.id,
+          ),
+        }));
+        setNodeDetails((prev) => {
+          const next = { ...prev };
+          delete next[node.id];
+          return next;
+        });
+        if (selectedNodeId === node.id) {
+          setSelectedNodeId(null);
+        }
+      } catch (err) {
+        console.error("Failed to delete entity", err);
+      }
+    },
+    [token, selectedNodeId],
+  );
+
+  const handleEditEntity = useCallback(
+    (node: BrainNode) => {
+      const currentLabel = node.label || node.id;
+      const newLabel = window.prompt("Update name", currentLabel);
+      if (!newLabel) return;
+      const trimmedLabel = newLabel.trim();
+      if (!trimmedLabel || trimmedLabel === currentLabel) return;
+      const newSummaryPrompt = window.prompt(
+        "Update summary / notes (optional)",
+        node.summary || "",
+      );
+      const updatedSummary =
+        newSummaryPrompt === null ? node.summary || "" : newSummaryPrompt;
+      const updatedNode: BrainNode = {
+        ...node,
+        label: trimmedLabel,
+        summary: updatedSummary,
+      };
+      setGraphData((prev) => ({
+        nodes: prev.nodes.map((n) =>
+          n.id === node.id
+            ? { ...n, label: trimmedLabel, summary: updatedSummary }
+            : n,
+        ),
+        links: prev.links,
+      }));
+      setNodeDetails((prev) => {
+        const next = { ...prev };
+        delete next[node.id];
+        return next;
+      });
+      persistNode(updatedNode);
+    },
+    [persistNode],
   );
 
   const persistLink = useCallback(
@@ -568,6 +663,51 @@ function App() {
     setIngestBusy(false);
   };
 
+  const runHogSearch = useCallback(
+    async (query: string, mode: "company" | "people") => {
+      if (!token) {
+        setError("Please login first");
+        return;
+      }
+      const trimmed = query.trim();
+      if (!trimmed) {
+        setError("Enter a search query or URL");
+        return;
+      }
+      setScanBusy(true);
+      setError(null);
+      try {
+        const endpoint = mode === "company" ? "companies" : "people";
+        const res = await fetch(`${API_URL}/api/hog/search/${endpoint}`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({ query: trimmed }),
+        });
+        const payload = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(payload?.error || "Hog search failed");
+        }
+        const items = coerceHogResults(payload);
+        setHogResults({ type: mode, items });
+        addMessage({
+          role: "agent",
+          text: `The Hog found ${items.length} ${
+            mode === "company" ? "companies" : "people"
+          } for "${trimmed}".`,
+        });
+      } catch (err: any) {
+        console.error("Hog search failed", err);
+        setError(err.message || "Hog search failed");
+      } finally {
+        setScanBusy(false);
+      }
+    },
+    [token, addMessage],
+  );
+
   const scanWebsite = async (target?: string) => {
     if (!token) {
       setError("Please login first");
@@ -580,17 +720,33 @@ function App() {
     }
 
     try {
-      // Detect if it's a LinkedIn profile
       const isLinkedInProfile = /linkedin\.com\/in\/([^/]+)/i.test(rawInput);
+      const looksLikeUrl = /^(https?:\/\/|www\.)/i.test(rawInput);
+      const manualTarget = Boolean(target);
 
-      if (isLinkedInProfile) {
-        await scanLinkedInProfile(rawInput);
-        return;
+      if (!manualTarget) {
+        if (hogSearchMode === "people") {
+          if (isLinkedInProfile) {
+            await scanLinkedInProfile(rawInput);
+          } else {
+            await runHogSearch(rawInput, "people");
+          }
+          return;
+        }
+        if (isLinkedInProfile) {
+          await scanLinkedInProfile(rawInput);
+          return;
+        }
+        if (!looksLikeUrl) {
+          await runHogSearch(rawInput, "company");
+          return;
+        }
       }
 
       const normalized = normalizeWebsite(rawInput);
       setWebsite(normalized.url);
       setError(null);
+      setHogResults(null);
       const nodeId = `company:${normalized.domain}`;
 
       // Check cache first
@@ -607,61 +763,49 @@ function App() {
 
       setScanBusy(true);
 
-      // Parallel fetch: Hog scan + web search for additional info
-      const [hogRes, enrichRes] = await Promise.allSettled([
-        fetch(`${API_URL}/api/hog/scan`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${token}`,
-          },
-          body: JSON.stringify({ website: normalized.url }),
-        }),
-        fetch(`${API_URL}/api/hog/enrich-company`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${token}`,
-          },
-          body: JSON.stringify({
-            company_name: titleFromDomain(normalized.domain),
-            website: normalized.url,
-          }),
-        }),
-      ]);
+      const hogRes = await fetch(`${API_URL}/api/hog/scan`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ website: normalized.url }),
+      });
 
       let signals: HogSignal[] = [];
-      let enrichedData: any = {};
+      let hogData: any = {};
 
-      if (hogRes.status === "fulfilled") {
-        const data = await hogRes.value.json();
-        if (hogRes.value.ok) {
-          signals = Array.isArray(data.signals) ? data.signals : [];
-        }
-      }
-
-      if (enrichRes.status === "fulfilled" && enrichRes.value.ok) {
-        enrichedData = await enrichRes.value.json();
+      if (hogRes.ok) {
+        const data = await hogRes.json();
+        hogData = data;
+        signals = Array.isArray(data.signals) ? data.signals : [];
       }
 
       // Infer sector from signals/domain
-      const sector = inferSector(normalized.domain, signals);
+      const sector = hogData.sector || inferSector(normalized.domain, signals);
 
       const node: BrainNode = {
         id: nodeId,
         type: "company",
-        label: enrichedData.name || titleFromDomain(normalized.domain),
+        label: hogData.name || titleFromDomain(normalized.domain),
         website: normalized.url,
         summary:
-          enrichedData.description ||
-          `The Hog streamed ${signals.length} signal${signals.length === 1 ? "" : "s"} over the past 30 days.`,
+          hogData.description ||
+          (signals.length
+            ? signals
+                .slice(0, 3)
+                .map((s: any) => s.content)
+                .filter(Boolean)
+                .join(" · ")
+            : `The Hog streamed 0 signals over the past 30 days.`),
         tags: dedupe([
-          ...signals.map((signal) => signal.source),
-          ...(enrichedData.tags || []),
+          ...signals.map((signal: any) => signal.source).filter(Boolean),
+          ...(hogData.tags || []),
         ]),
         signals,
         source: "hog",
-        sector: enrichedData.sector || sector,
+        sector,
+        investmentInsights: hogData.investmentInsights,
       };
 
       // Cache the result
@@ -683,6 +827,7 @@ function App() {
   const scanLinkedInProfile = async (linkedinUrl: string) => {
     setScanBusy(true);
     setError(null);
+    setHogResults(null);
 
     try {
       const match = linkedinUrl.match(/linkedin\.com\/in\/([^/]+)/);
@@ -1088,19 +1233,52 @@ function App() {
               </p>
             )}
             {founders.map((founder) => (
-              <button
+              <div
                 key={founder.id}
-                className={`entity-item ${selectedNodeId === founder.id ? "active" : ""}`}
-                onClick={() => setSelectedNodeId(founder.id)}
+                className={`entity-row ${
+                  selectedNodeId === founder.id ? "active" : ""
+                }`}
               >
-                <span className="entity-icon founder">ƒ</span>
-                <div>
-                  <p className="entity-name">{founder.label}</p>
-                  <p className="entity-meta">
-                    {founder.stage || "Unknown stage"}
-                  </p>
+                <button
+                  type="button"
+                  className={`entity-item ${
+                    selectedNodeId === founder.id ? "active" : ""
+                  }`}
+                  onClick={() => setSelectedNodeId(founder.id)}
+                >
+                  <span className="entity-icon founder">ƒ</span>
+                  <div>
+                    <p className="entity-name">{founder.label}</p>
+                    <p className="entity-meta">
+                      {founder.stage || "Unknown stage"}
+                    </p>
+                  </div>
+                </button>
+                <div className="entity-actions">
+                  <button
+                    type="button"
+                    className="icon-btn"
+                    title="Edit founder"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      handleEditEntity(founder);
+                    }}
+                  >
+                    ✏️
+                  </button>
+                  <button
+                    type="button"
+                    className="icon-btn danger"
+                    title="Delete founder"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      handleDeleteEntity(founder);
+                    }}
+                  >
+                    🗑
+                  </button>
                 </div>
-              </button>
+              </div>
             ))}
           </div>
 
@@ -1112,19 +1290,52 @@ function App() {
               </p>
             )}
             {companies.map((company) => (
-              <button
+              <div
                 key={company.id}
-                className={`entity-item ${selectedNodeId === company.id ? "active" : ""}`}
-                onClick={() => setSelectedNodeId(company.id)}
+                className={`entity-row ${
+                  selectedNodeId === company.id ? "active" : ""
+                }`}
               >
-                <span className="entity-icon company">◎</span>
-                <div>
-                  <p className="entity-name">{company.label}</p>
-                  <p className="entity-meta">
-                    {company.sector || "Unknown sector"}
-                  </p>
+                <button
+                  type="button"
+                  className={`entity-item ${
+                    selectedNodeId === company.id ? "active" : ""
+                  }`}
+                  onClick={() => setSelectedNodeId(company.id)}
+                >
+                  <span className="entity-icon company">◎</span>
+                  <div>
+                    <p className="entity-name">{company.label}</p>
+                    <p className="entity-meta">
+                      {company.sector || "Unknown sector"}
+                    </p>
+                  </div>
+                </button>
+                <div className="entity-actions">
+                  <button
+                    type="button"
+                    className="icon-btn"
+                    title="Edit company"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      handleEditEntity(company);
+                    }}
+                  >
+                    ✏️
+                  </button>
+                  <button
+                    type="button"
+                    className="icon-btn danger"
+                    title="Delete company"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      handleDeleteEntity(company);
+                    }}
+                  >
+                    🗑
+                  </button>
                 </div>
-              </button>
+              </div>
             ))}
           </div>
         </aside>
@@ -1198,25 +1409,78 @@ function App() {
               >
                 {ingestBusy ? "Extracting…" : "Extract to Brain"}
               </button>
-              <div className="website-row">
-                <input
-                  type="url"
-                  value={website}
-                  onChange={(event) => setWebsite(event.target.value)}
-                  placeholder="https://company.com or linkedin.com/in/username"
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") scanWebsite();
-                  }}
-                />
+              <div className="hog-mode-toggle">
                 <button
-                  className="ghost-btn"
-                  onClick={() => scanWebsite()}
-                  disabled={scanBusy}
+                  type="button"
+                  className={hogSearchMode === "company" ? "active" : ""}
+                  onClick={() => setHogSearchMode("company")}
                 >
-                  {scanBusy ? "Scanning…" : "Enrich with The Hog"}
+                  Company search
+                </button>
+                <button
+                  type="button"
+                  className={hogSearchMode === "people" ? "active" : ""}
+                  onClick={() => setHogSearchMode("people")}
+                >
+                  People search
                 </button>
               </div>
+              <input
+                type="text"
+                value={website}
+                onChange={(event) => setWebsite(event.target.value)}
+                placeholder={
+                  hogSearchMode === "company"
+                    ? "https://company.com or “AI infra in SF”"
+                    : "linkedin.com/in/... or “VP eng in SF”"
+                }
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") scanWebsite();
+                }}
+              />
+              <button
+                className="ghost-btn"
+                onClick={() => scanWebsite()}
+                disabled={scanBusy}
+              >
+                {scanBusy
+                  ? "Searching…"
+                  : hogSearchMode === "people"
+                    ? "Search People"
+                    : "Search Companies"}
+              </button>
             </div>
+            {hogResults && (
+              <div className="hog-results">
+                <p className="section-label">
+                  Hog {hogResults.type === "company" ? "Company" : "People"}{" "}
+                  search · {hogResults.items.length} result
+                  {hogResults.items.length === 1 ? "" : "s"}
+                </p>
+                {hogResults.items.length ? (
+                  <ul>
+                    {hogResults.items.slice(0, 5).map((item, idx) => (
+                      <li
+                        key={`${hogResults.type}-${idx}`}
+                        className="hog-result-item"
+                      >
+                        <p className="result-title">
+                          {item?.name ||
+                            item?.title ||
+                            item?.headline ||
+                            `Result ${idx + 1}`}
+                        </p>
+                        <p className="result-meta">
+                          {describeHogResult(item, hogResults.type)}
+                        </p>
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="muted">No results returned.</p>
+                )}
+              </div>
+            )}
             {error && <p className="error-text">{error}</p>}
           </section>
 
@@ -1253,7 +1517,7 @@ function App() {
                     ctx.beginPath();
                     ctx.arc(node.x ?? 0, node.y ?? 0, 5, 0, Math.PI * 2);
                     ctx.fill();
-                    ctx.fillStyle = "#ffffff";
+                    ctx.fillStyle = "#1e1b4b";
                     ctx.fillText(label, (node.x ?? 0) + 8, (node.y ?? 0) + 4);
                   }}
                   onNodeClick={(node: NodeObject<BrainNode>) => {
@@ -1291,8 +1555,11 @@ function App() {
                   {selectedNode.type === "company" && selectedNode.website && (
                     <button
                       className="ghost-btn"
-                      disabled={scanBusy}
-                      onClick={() => scanWebsite(selectedNode.website!)}
+                      disabled={scanBusy || !selectedNode.website}
+                      onClick={() =>
+                        selectedNode.website &&
+                        scanWebsite(selectedNode.website)
+                      }
                     >
                       {scanBusy ? "Scanning…" : "Scan with The Hog"}
                     </button>
@@ -1598,13 +1865,51 @@ function App() {
 
 export default App;
 
-function normalizeWebsite(value: string): { url: string; domain: string } {
-  const trimmed = value.trim();
-  const withProtocol = /^https?:\/\//i.test(trimmed)
+function stripFrontmatter(content: string): string {
+  const trimmed = content.trim();
+  if (!trimmed.startsWith("---")) return trimmed;
+  const end = trimmed.indexOf("---", 3);
+  if (end === -1) return trimmed;
+  return trimmed.slice(end + 3).trim();
+}
+
+function normalizeWebsite(input: string) {
+  const trimmed = input.trim();
+  const prefixed = /^https?:\/\//i.test(trimmed)
     ? trimmed
     : `https://${trimmed}`;
-  const parsed = new URL(withProtocol);
-  return { url: parsed.origin, domain: parsed.hostname };
+  const parsed = new URL(prefixed);
+  return { url: prefixed, domain: parsed.hostname };
+}
+
+function coerceHogResults(payload: any): any[] {
+  if (!payload) return [];
+  if (Array.isArray(payload.results)) return payload.results;
+  if (Array.isArray(payload.items)) return payload.items;
+  if (Array.isArray(payload.data)) return payload.data;
+  if (Array.isArray(payload.matches)) return payload.matches;
+  if (Array.isArray(payload)) return payload;
+  return [];
+}
+
+function describeHogResult(item: any, type: "company" | "people"): string {
+  if (!item) return "";
+  if (type === "company") {
+    const parts = [
+      item.sector || item.industry,
+      item.location || item.hq,
+      item.domain || item.website,
+    ];
+    const text = parts.filter(Boolean).join(" • ");
+    return text || item.description?.slice(0, 120) || "";
+  }
+  const parts = [
+    item.headline || item.title,
+    item.company || item.current_company,
+    item.location,
+  ];
+  const text = parts.filter(Boolean).join(" • ");
+  return text || item.summary?.slice(0, 120) || "";
 }
 
 function slugify(text: string): string {

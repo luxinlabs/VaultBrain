@@ -30,6 +30,13 @@ router.put('/:slug', (req, res) => {
   } catch (e: any) { res.status(e.message.includes('Permission') ? 403 : 500).json({ error: e.message }); }
 });
 
+router.delete('/:slug', (req, res) => {
+  try {
+    gbrainService.deletePage(req.params.slug, req.user);
+    res.json({ success: true });
+  } catch (e: any) { res.status(e.message.includes('Permission') ? 403 : 500).json({ error: e.message }); }
+});
+
 router.post('/query', (req, res) => {
   try {
     if (!req.body.query) return res.status(400).json({ error: 'Query required' });

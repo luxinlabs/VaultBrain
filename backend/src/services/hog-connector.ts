@@ -23,6 +23,22 @@ type HogEndpoint = {
   label: string;
 };
 
+type InvestmentInsights = {
+  marketSize: string;
+  traction: string;
+  teamQuality: string;
+  productMarketFit: string;
+  competitiveMoat: string;
+  fundingStatus: string;
+};
+
+type HogSearchOptions = {
+  limit?: number;
+  includeSignals?: boolean;
+  includeContacts?: boolean;
+  filters?: Record<string, any>;
+};
+
 export class HogConnector {
   private accessKey: string | null;
   private secretKey: string | null;
@@ -138,10 +154,111 @@ export class HogConnector {
     return [200, 404, 502, 503].includes(error.status);
   }
 
-  async scanWebsite(website: string): Promise<HogScanResponse & { website: string; domain: string }> {
+  async scanWebsite(website: string): Promise<
+    HogScanResponse & {
+      website: string;
+      domain: string;
+      description?: string;
+      name?: string;
+      sector?: string;
+      investmentInsights?: InvestmentInsights;
+    }
+  > {
     const normalized = this.normalizeWebsite(website);
-    const data = await this.scan(normalized.url, 'company');
-    return { ...data, website: normalized.url, domain: normalized.domain };
+    const companyName = normalized.domain
+      .replace(/^www\./, '')
+      .split('.')[0]
+      .replace(/-/g, ' ')
+      .replace(/\b\w/g, (c) => c.toUpperCase());
+
+    const queryString = `${companyName} company ${normalized.domain}`.trim();
+
+    const [searchResult, scrapeResult] = await Promise.allSettled([
+      this.searchCompanies(queryString, { includeSignals: true, limit: 1 }),
+      this.scan(normalized.url, 'company'),
+    ]);
+
+    let signals: any[] = [];
+    let description: string | undefined;
+    let name: string | undefined;
+    let sector: string | undefined;
+
+    if (searchResult.status === 'fulfilled') {
+      const results = coerceArray(searchResult.value);
+      const match = results[0];
+      if (match) {
+        name = match.name || match.company_name || match.title;
+        description = match.description || match.summary || match.about;
+        sector = match.industry || match.sector || match.category;
+        const rawSignals: any[] = coerceArray(match.signals);
+        signals = rawSignals.map((s: any) => normalizeHogSignal(s, normalized.domain));
+      }
+    }
+
+    if (scrapeResult.status === 'fulfilled') {
+      const scrapeSignals: any[] = coerceArray(scrapeResult.value?.signals);
+      const mapped = scrapeSignals.map((s: any) => normalizeHogSignal(s, normalized.domain));
+      signals = dedupSignals([...signals, ...mapped]);
+    }
+
+    const investmentInsights = deriveInvestmentInsightsFromSignals(signals, sector);
+
+    return {
+      signals,
+      description,
+      name,
+      sector,
+      investmentInsights,
+      website: normalized.url,
+      domain: normalized.domain,
+    };
+  }
+
+  private async postSearch(path: string, payload: Record<string, any>) {
+    const { accessKey, secretKey } = this.ensureApiKeys();
+    const url = `${this.baseUrl}${path}`;
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        'X-Access-Key': accessKey,
+        'X-Secret-Key': secretKey,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(payload),
+    });
+    const text = await response.text();
+    if (!response.ok) {
+      throw new HogApiError(response.status, text || response.statusText, path);
+    }
+    try {
+      return JSON.parse(text);
+    } catch (error) {
+      throw new HogApiError(response.status, `Invalid JSON: ${(error as Error).message}`, path);
+    }
+  }
+
+  async searchCompanies(query: string, options: HogSearchOptions = {}) {
+    if (!query?.trim()) {
+      throw new Error('query is required');
+    }
+    return this.postSearch('/api/v1/companies/search', {
+      query,
+      limit: options.limit ?? 25,
+      includeSignals: options.includeSignals ?? true,
+      filters: options.filters,
+    });
+  }
+
+  async searchPeople(query: string, options: HogSearchOptions = {}) {
+    if (!query?.trim()) {
+      throw new Error('query is required');
+    }
+    return this.postSearch('/api/v1/people/search', {
+      query,
+      limit: options.limit ?? 25,
+      includeContacts: options.includeContacts ?? true,
+      includeSignals: options.includeSignals ?? true,
+    });
   }
 
   async enrichPerson(linkedinUrl: string): Promise<any> {
@@ -228,3 +345,56 @@ export class HogConnector {
 }
 
 export const hogConnector = new HogConnector();
+
+function coerceArray(value: any): any[] {
+  if (!value) return [];
+  if (Array.isArray(value)) return value;
+  if (Array.isArray(value.results)) return value.results;
+  if (Array.isArray(value.items)) return value.items;
+  if (Array.isArray(value.data)) return value.data;
+  if (Array.isArray(value.matches)) return value.matches;
+  return [];
+}
+
+function normalizeHogSignal(s: any, domain: string): Record<string, any> {
+  if (!s) return {};
+  return {
+    type: s.type || s.signal_type || s.category || 'mention',
+    source: s.source || s.platform || domain,
+    content: s.content || s.text || s.title || s.description || '',
+    url: s.url || s.link || null,
+    timestamp: s.timestamp || s.date || s.published_at || new Date().toISOString(),
+    engagement: s.engagement || s.metrics || {},
+  };
+}
+
+function dedupSignals(signals: any[]): any[] {
+  const seen = new Set<string>();
+  return signals.filter((s) => {
+    const key = `${s.type}:${s.url || ''}:${(s.content || '').slice(0, 80)}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function deriveInvestmentInsightsFromSignals(signals: any[], sector?: string): InvestmentInsights {
+  const text = signals.map((s) => s.content || '').join(' ').toLowerCase();
+  const marketMatch = text.match(/(billion|million|tam|market|industry)/);
+  const tractionSignals = signals.filter((s) =>
+    ['mentions', 'press', 'product', 'funding', 'hiring'].includes(s.type)
+  );
+  const hiringMention = text.match(/hiring|headcount|recruiting|open role/);
+  const pmfMention = text.match(/launched|pilot|customers|deployment|rolled out/);
+  const moatMention = text.match(/only|exclusive|proprietary|leading|patent/);
+  const fundingMention = signals.find((s) => s.type === 'funding');
+
+  return {
+    marketSize: marketMatch ? 'Market dynamics referenced' : sector ? `Operating in ${sector}` : 'Market intel pending',
+    traction: tractionSignals.length ? `${tractionSignals.length} signals (press, product, hiring)` : 'Awaiting traction signals',
+    teamQuality: hiringMention ? 'Hiring momentum detected' : 'Team signals pending',
+    productMarketFit: pmfMention ? 'Launch/pilot references detected' : 'Validating product fit',
+    competitiveMoat: moatMention ? moatMention[0] : sector || 'Moat narrative TBD',
+    fundingStatus: fundingMention ? fundingMention.content || 'Funding activity reported' : 'No funding signals yet',
+  };
+}
