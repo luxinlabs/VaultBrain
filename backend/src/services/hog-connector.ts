@@ -201,7 +201,7 @@ export class HogConnector {
       signals = dedupSignals([...signals, ...mapped]);
     }
 
-    const investmentInsights = deriveInvestmentInsightsFromSignals(signals, sector);
+    const investmentInsights = deriveInvestmentInsightsFromSignals(signals, sector, description);
 
     return {
       signals,
@@ -378,23 +378,31 @@ function dedupSignals(signals: any[]): any[] {
   });
 }
 
-function deriveInvestmentInsightsFromSignals(signals: any[], sector?: string): InvestmentInsights {
-  const text = signals.map((s) => s.content || '').join(' ').toLowerCase();
+function deriveInvestmentInsightsFromSignals(signals: any[], sector?: string, description?: string): InvestmentInsights {
+  const signalText = signals.map((s) => s.content || '').join(' ').toLowerCase();
+  const text = `${description || ''} ${signalText}`.toLowerCase();
   const marketMatch = text.match(/(billion|million|tam|market|industry)/);
   const tractionSignals = signals.filter((s) =>
     ['mentions', 'press', 'product', 'funding', 'hiring'].includes(s.type)
   );
   const hiringMention = text.match(/hiring|headcount|recruiting|open role/);
-  const pmfMention = text.match(/launched|pilot|customers|deployment|rolled out/);
+  const pmfMention = text.match(/launched|pilot|customers|deployment|rolled out|users|revenue/);
   const moatMention = text.match(/only|exclusive|proprietary|leading|patent/);
-  const fundingMention = signals.find((s) => s.type === 'funding');
+  const fundingMention = signals.find((s) => s.type === 'funding') ||
+    (text.match(/seed|series [abc]|pre-seed|raised|funding|investment/) ? { content: null } : null);
+
+  const tractionLabel = tractionSignals.length
+    ? `${tractionSignals.length} signal${tractionSignals.length === 1 ? '' : 's'} (press, product, hiring)`
+    : description
+      ? 'Described — no live press signals yet'
+      : 'Awaiting traction signals';
 
   return {
     marketSize: marketMatch ? 'Market dynamics referenced' : sector ? `Operating in ${sector}` : 'Market intel pending',
-    traction: tractionSignals.length ? `${tractionSignals.length} signals (press, product, hiring)` : 'Awaiting traction signals',
+    traction: tractionLabel,
     teamQuality: hiringMention ? 'Hiring momentum detected' : 'Team signals pending',
     productMarketFit: pmfMention ? 'Launch/pilot references detected' : 'Validating product fit',
     competitiveMoat: moatMention ? moatMention[0] : sector || 'Moat narrative TBD',
-    fundingStatus: fundingMention ? fundingMention.content || 'Funding activity reported' : 'No funding signals yet',
+    fundingStatus: fundingMention ? (typeof fundingMention.content === 'string' && fundingMention.content ? fundingMention.content : 'Funding activity reported') : 'No funding signals yet',
   };
 }

@@ -482,8 +482,22 @@
   gap: 1rem;
 }
 
+.hog-search-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  margin-top: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.hog-search-row .notes-input {
+  flex: 1;
+  min-width: 0;
+}
+
 .hog-mode-toggle {
   display: inline-flex;
+  flex-shrink: 0;
   border: 1px solid var(--border-color);
   border-radius: 999px;
   overflow: hidden;

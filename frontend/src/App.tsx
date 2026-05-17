@@ -212,7 +212,6 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [ingestBusy, setIngestBusy] = useState(false);
   const [scanBusy, setScanBusy] = useState(false);
-  const [notes, setNotes] = useState("");
   const [dragging, setDragging] = useState(false);
   const [graphData, setGraphData] = useState<{
     nodes: BrainNode[];
@@ -242,6 +241,10 @@ function App() {
   const [tokenTesting, setTokenTesting] = useState(false);
 
   const graphRef = useRef<HTMLDivElement | null>(null);
+  const graphNodesRef = useRef<BrainNode[]>([]);
+  useEffect(() => {
+    graphNodesRef.current = graphData.nodes;
+  }, [graphData.nodes]);
   const [graphSize, setGraphSize] = useState({ width: 600, height: 320 });
 
   useEffect(() => {
@@ -338,8 +341,9 @@ function App() {
     ? selectedDetail.signals
     : selectedNode?.signals || [];
   const selectedTimeline = selectedDetail?.timeline || [];
-  const selectedSummaryText =
-    selectedDetail?.page?.content || selectedNode?.summary || "";
+  const selectedSummaryText = stripFrontmatter(
+    selectedDetail?.page?.content || selectedNode?.summary || "",
+  );
   const hasDetail = selectedNodeId
     ? Boolean(nodeDetails[selectedNodeId])
     : false;
@@ -379,6 +383,99 @@ function App() {
           ),
           links: prev.links,
         }));
+
+        // Auto-enrich from Hog when a company node has no stored signals
+        const currentNode = graphNodesRef.current.find(
+          (n) => n.id === selectedNodeId,
+        );
+        if (
+          currentNode?.type === "company" &&
+          !currentNode?.investmentInsights &&
+          (data.signals?.length ?? 0) === 0
+        ) {
+          const label = currentNode.label || selectedNodeId;
+          try {
+            const hogRes = await fetch(`${API_URL}/api/hog/search/companies`, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                Authorization: `Bearer ${token}`,
+              },
+              body: JSON.stringify({
+                query: label,
+                limit: 1,
+                includeSignals: true,
+              }),
+            });
+            if (hogRes.ok && !cancelled) {
+              const hogPayload = await hogRes.json();
+              const items: any[] = (() => {
+                if (Array.isArray(hogPayload.results)) return hogPayload.results;
+                if (Array.isArray(hogPayload.items)) return hogPayload.items;
+                if (Array.isArray(hogPayload.data)) return hogPayload.data;
+                if (Array.isArray(hogPayload.matches))
+                  return hogPayload.matches;
+                if (Array.isArray(hogPayload)) return hogPayload;
+                return [];
+              })();
+              const match = items[0];
+              if (match) {
+                const rawSignals: any[] = Array.isArray(match.signals)
+                  ? match.signals
+                  : [];
+                const enrichedSignals: HogSignal[] = rawSignals.map(
+                  (s: any) => ({
+                    type:
+                      s.type || s.signal_type || s.category || "mention",
+                    source: s.source || s.platform || label,
+                    content:
+                      s.content ||
+                      s.text ||
+                      s.title ||
+                      s.description ||
+                      "",
+                    url: s.url || s.link,
+                    timestamp:
+                      s.timestamp || s.date || s.published_at,
+                    engagement: s.engagement || s.metrics || {},
+                  }),
+                );
+                const description: string =
+                  match.description || match.summary || match.about || "";
+                const sector: string =
+                  match.industry ||
+                  match.sector ||
+                  match.category ||
+                  currentNode.sector ||
+                  "";
+                const richText = `${description} ${enrichedSignals.map((s) => s.content).join(" ")}`;
+                const insights = computeInvestmentCriteria(
+                  richText,
+                  [],
+                  enrichedSignals,
+                  sector,
+                );
+                setGraphData((prev) => ({
+                  nodes: prev.nodes.map((node) =>
+                    node.id === selectedNodeId
+                      ? {
+                          ...node,
+                          investmentInsights: insights,
+                          sector: sector || node.sector,
+                          signals: enrichedSignals.length
+                            ? enrichedSignals
+                            : node.signals,
+                        }
+                      : node,
+                  ),
+                  links: prev.links,
+                }));
+              }
+            }
+          } catch (hogErr) {
+            console.warn("Hog auto-enrichment failed:", hogErr);
+          }
+        }
       } catch (detailError) {
         console.error("Failed to fetch node detail", detailError);
       } finally {
@@ -441,6 +538,22 @@ function App() {
     () => graphData.nodes.filter((node) => node.type === "company"),
     [graphData.nodes],
   );
+  const founderCompanyMap = useMemo(() => {
+    const nodeById = new Map(graphData.nodes.map((n) => [n.id, n]));
+    const map = new Map<string, string>();
+    for (const link of graphData.links) {
+      const src = typeof link.source === "string" ? link.source : (link.source as any).id;
+      const tgt = typeof link.target === "string" ? link.target : (link.target as any).id;
+      const srcNode = nodeById.get(src);
+      const tgtNode = nodeById.get(tgt);
+      if (srcNode?.type === "founder" && tgtNode?.type === "company") {
+        map.set(srcNode.id, tgtNode.label);
+      } else if (tgtNode?.type === "founder" && srcNode?.type === "company") {
+        map.set(tgtNode.id, srcNode.label);
+      }
+    }
+    return map;
+  }, [graphData.nodes, graphData.links]);
 
   const addMessage = useCallback((message: ChatMessage) => {
     setMessages((prev) => [...prev, message]);
@@ -619,27 +732,6 @@ function App() {
     } catch (err) {
       alert("Login failed");
     }
-  };
-
-  const handleNotesExtract = async () => {
-    if (!notes.trim()) return;
-    setIngestBusy(true);
-    const payload = extractEntitiesFromText(notes.trim());
-    if (payload.nodes.length) {
-      mergeGraphData(payload.nodes, payload.links);
-      setSelectedNodeId(payload.nodes[payload.nodes.length - 1].id);
-      addMessage({
-        role: "agent",
-        text: `Structured ${payload.nodes.length} entity${payload.nodes.length === 1 ? "" : "ies"} from your notes via GStack and saved them to GBrain.`,
-      });
-    } else {
-      addMessage({
-        role: "system",
-        text: "I read that text but couldn't identify distinct founders or companies. Try adding explicit labels like 'Company:' or 'Founder:'.",
-      });
-    }
-    setNotes("");
-    setIngestBusy(false);
   };
 
   const handleFiles = async (fileList: FileList | File[]) => {
@@ -1250,7 +1342,10 @@ function App() {
                   <div>
                     <p className="entity-name">{founder.label}</p>
                     <p className="entity-meta">
-                      {founder.stage || "Unknown stage"}
+                      {founderCompanyMap.get(founder.id) ||
+                        founder.sector ||
+                        founder.stage ||
+                        "Founder"}
                     </p>
                   </div>
                 </button>
@@ -1394,21 +1489,7 @@ function App() {
           </section>
 
           <section className="text-ingest">
-            <textarea
-              className="notes-input"
-              rows={4}
-              value={notes}
-              placeholder="Or paste raw text here — label sections with Company:, Founder:, Stage:, Website:, etc."
-              onChange={(event) => setNotes(event.target.value)}
-            />
-            <div className="text-actions">
-              <button
-                className="primary-btn"
-                disabled={ingestBusy}
-                onClick={handleNotesExtract}
-              >
-                {ingestBusy ? "Extracting…" : "Extract to Brain"}
-              </button>
+            <div className="hog-search-row">
               <div className="hog-mode-toggle">
                 <button
                   type="button"
@@ -1427,12 +1508,13 @@ function App() {
               </div>
               <input
                 type="text"
+                className="notes-input"
                 value={website}
                 onChange={(event) => setWebsite(event.target.value)}
                 placeholder={
                   hogSearchMode === "company"
-                    ? "https://company.com or “AI infra in SF”"
-                    : "linkedin.com/in/... or “VP eng in SF”"
+                    ? 'https://company.com or "AI infra in SF"'
+                    : 'linkedin.com/in/... or "VP eng in SF"'
                 }
                 onKeyDown={(event) => {
                   if (event.key === "Enter") scanWebsite();
@@ -1444,7 +1526,7 @@ function App() {
                 disabled={scanBusy}
               >
                 {scanBusy
-                  ? "Searching…"
+                  ? "Searching..."
                   : hogSearchMode === "people"
                     ? "Search People"
                     : "Search Companies"}
@@ -1503,7 +1585,11 @@ function App() {
                   backgroundColor="transparent"
                   graphData={graphData}
                   nodeAutoColorBy="type"
-                  linkColor={() => "rgba(255,255,255,0.12)"}
+                  linkColor={() =>
+                    theme === "light"
+                      ? "rgba(30,27,75,0.4)"
+                      : "rgba(255,255,255,0.12)"
+                  }
                   nodeCanvasObject={(
                     node: NodeObject<BrainNode> & { x?: number; y?: number },
                     ctx: CanvasRenderingContext2D,
@@ -1517,7 +1603,7 @@ function App() {
                     ctx.beginPath();
                     ctx.arc(node.x ?? 0, node.y ?? 0, 5, 0, Math.PI * 2);
                     ctx.fill();
-                    ctx.fillStyle = "#1e1b4b";
+                    ctx.fillStyle = theme === "light" ? "#1e1b4b" : "#e8ecff";
                     ctx.fillText(label, (node.x ?? 0) + 8, (node.y ?? 0) + 4);
                   }}
                   onNodeClick={(node: NodeObject<BrainNode>) => {
