@@ -58,9 +58,13 @@ router.post('/compare', authMiddleware, async (req, res) => {
 
     const trunc = (s: string) => s.length > 300 ? s.substring(0, 300) + '…' : s;
 
-    const recommendation =
-      aggressive.metrics.savingsPercent >= 50 ? 'aggressive' :
-      balanced.metrics.savingsPercent   >= 25 ? 'balanced'   : 'conservative';
+    const recommendation: 'aggressive' | 'balanced' | 'conservative' =
+      aggressive.metrics.savingsPercent >= balanced.metrics.savingsPercent &&
+      aggressive.metrics.savingsPercent >= conservative.metrics.savingsPercent
+        ? 'aggressive'
+        : balanced.metrics.savingsPercent >= conservative.metrics.savingsPercent
+          ? 'balanced'
+          : 'conservative';
 
     res.json({
       comparison: {

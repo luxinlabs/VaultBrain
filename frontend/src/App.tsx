@@ -1224,7 +1224,14 @@ function App() {
                   <p className="pill subtle">With optimization layer</p>
                   <h3>{optimized.optimizedTokens} tokens</h3>
                   <p className="token-savings">
-                    Saved {optimized.savingsPercent.toFixed(1)}% of context
+                    Saved {optimized.savings} tokens ({optimized.savingsPercent.toFixed(1)}% of context)
+                  </p>
+                  <p className="token-savings">
+                    {baseline && optimized.optimizedTokens < baseline.originalTokens
+                      ? `${baseline.originalTokens - optimized.optimizedTokens} fewer tokens than unoptimized`
+                      : optimized.optimizedTokens === baseline?.originalTokens
+                        ? 'No reduction vs unoptimized'
+                        : `${optimized.optimizedTokens - (baseline?.originalTokens ?? 0)} more tokens than unoptimized`}
                   </p>
                   <p className="token-snippet">
                     {
