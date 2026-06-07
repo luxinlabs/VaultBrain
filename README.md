@@ -365,4 +365,3 @@ MIT
 Built for GStack x GBrain Hackathon  
 May 16, 2026 | San Francisco, CA
 
-**Target:** Grand Prize (YC interview + 1:1 with Garry Tan)
